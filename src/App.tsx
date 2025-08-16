@@ -1,6 +1,3 @@
-// src/App.tsx — полная сборка с кликом для движения, ИИ-генерацией мира,
-// ветвистым диалогом (варианты ответов) и динамическими инструментами (modify_tiles и др.)
-
 import React, { useEffect, useRef, useState } from "react";
 
 // ===== Типы =====
@@ -93,10 +90,11 @@ export default function App() {
   const [path, setPath] = useState<Vec2[]>([]);
   const viewportRef = useRef<HTMLDivElement>(null);
 
-  // ===== Диалог с вариантами =====
+  // ===== Диалог с вариантами и свободным вводом =====
   const [currentNpcId, setCurrentNpcId] = useState<string | null>(null);
   const [dialogueOptions, setDialogueOptions] = useState<ReplyOption[]>([]);
   const [historyByNpc, setHistoryByNpc] = useState<Record<string, DialogueTurn[]>>({});
+  const [playerInput, setPlayerInput] = useState("");
 
   // ===== Камера центрируется на игроке =====
   useEffect(() => {
@@ -108,7 +106,7 @@ export default function App() {
     }
   }, [player.x, player.y, map]);
 
-  // ===== Шаг по пути (каждые 100мс) =====
+  // ===== Шаг по пути =====
   useEffect(() => {
     if (!path.length) return;
     const id = window.setInterval(() => {
@@ -122,7 +120,33 @@ export default function App() {
     return () => clearInterval(id);
   }, [path.length]);
 
-  // ===== Вспомогательные на клиенте =====
+  // ===== Горячие клавиши: 1..9 для вариантов, Enter для отправки текста =====
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      const typing = tag === "input" || tag === "textarea" || (e.target as HTMLElement)?.isContentEditable;
+      if (npcThinking) return;
+
+      // Enter -> отправить свободный текст, если курсор в поле ввода
+      if (e.key === "Enter" && typing) {
+        e.preventDefault();
+        if (playerInput.trim()) sendFreeText(playerInput.trim());
+        return;
+      }
+      // Цифры 1..9 -> выбрать вариант (только если НЕ печатаем в поле)
+      if (!typing) {
+        const digit = Number(e.key);
+        if (digit >= 1 && digit <= 9 && dialogueOptions[digit - 1]) {
+          e.preventDefault();
+          chooseReply(dialogueOptions[digit - 1]);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dialogueOptions, npcThinking, playerInput]);
+
+  // ===== Хелперы =====
   function pushLog(s: string) {
     setLog((l) => [s, ...l].slice(0, 20));
   }
@@ -271,6 +295,7 @@ export default function App() {
         setPath([]);
         setDialogueOptions([]);
         setHistoryByNpc({});
+        setCurrentNpcId(null);
         pushLog("Создана новая локация ИИ.");
         if (data.text) pushLog("Вступление: " + data.text);
       }
@@ -292,7 +317,10 @@ export default function App() {
     setNpcThinking(true);
     setDialogueOptions([]);
 
-    if (initialMessage) pushNpcHistory(near.id, { speaker: "player", text: initialMessage });
+    if (initialMessage) {
+      pushNpcHistory(near.id, { speaker: "player", text: initialMessage });
+      pushLog(`Вы: ${truncate(initialMessage, 120)}`);
+    }
 
     try {
       const worldPayload = {
@@ -326,12 +354,13 @@ export default function App() {
   }
 
   async function chooseReply(opt: ReplyOption) {
-    if (!currentNpcId) return;
+    if (!currentNpcId) return talkToNearestNPC(opt.text);
     const npc = npcs.find((n) => n.id === currentNpcId);
     if (!npc) return;
 
     setDialogueOptions([]);
     pushNpcHistory(currentNpcId, { speaker: "player", text: opt.text });
+    pushLog(`Вы: ${truncate(opt.text, 120)}`);
     setNpcThinking(true);
 
     try {
@@ -352,6 +381,51 @@ export default function App() {
       setNpcReply(text);
       pushNpcHistory(currentNpcId, { speaker: "npc", text });
       pushLog(`${npc.name}: ${truncate(text, 140)}`);
+      for (const a of data.actions ?? []) applyAction(a);
+    } catch {
+      pushLog("Проблема связи с ИИ.");
+    } finally {
+      setNpcThinking(false);
+    }
+  }
+
+  // ===== Свободный текст =====
+  async function sendFreeText(raw: string) {
+    const text = raw.trim();
+    if (!text || npcThinking) return;
+
+    setPlayerInput("");
+    if (!currentNpcId) {
+      // если диалог не открыт — найдём ближайшего NPC и начнём с этого текста
+      await talkToNearestNPC(text);
+      return;
+    }
+    const npc = npcs.find((n) => n.id === currentNpcId);
+    if (!npc) return;
+
+    setDialogueOptions([]);
+    pushNpcHistory(currentNpcId, { speaker: "player", text });
+    pushLog(`Вы: ${truncate(text, 120)}`);
+    setNpcThinking(true);
+
+    try {
+      const worldPayload = { map: { w: map[0]?.length ?? 0, h: map.length }, npcs, enemies, items };
+      const resp = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          world: worldPayload,
+          npc: { id: npc.id, name: npc.name, role: npc.role },
+          history: historyByNpc[currentNpcId] ?? [],
+          playerMessage: text,
+          model,
+        }),
+      });
+      const data = await resp.json();
+      const reply = data.text ?? "";
+      setNpcReply(reply);
+      pushNpcHistory(currentNpcId, { speaker: "npc", text: reply });
+      pushLog(`${npc.name}: ${truncate(reply, 140)}`);
       for (const a of data.actions ?? []) applyAction(a);
     } catch {
       pushLog("Проблема связи с ИИ.");
@@ -441,7 +515,6 @@ export default function App() {
   // ===== Позиция игрока =====
   const plPos = isoToScreen(player.x, player.y);
 
-  // ===== JSX =====
   return (
     <div className="w-full h-full bg-neutral-900 text-neutral-100">
       {/* Верхняя панель */}
@@ -525,6 +598,7 @@ export default function App() {
             <button
               className="ml-auto text-sm px-3 py-1 rounded bg-neutral-800 border border-neutral-700 hover:bg-neutral-700"
               onClick={() => talkToNearestNPC()}
+              disabled={npcThinking}
             >
               Поговорить
             </button>
@@ -536,19 +610,44 @@ export default function App() {
 
           {/* Варианты ответов */}
           {dialogueOptions.length > 0 && (
-            <div className="mt-3 flex flex-col gap-2">
-              {dialogueOptions.map((o) => (
+            <div className="mt-3 grid gap-2">
+              {dialogueOptions.map((o, idx) => (
                 <button
                   key={o.id}
                   onClick={() => chooseReply(o)}
-                  className="text-sm px-3 py-2 rounded border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-left"
+                  disabled={npcThinking}
+                  className="text-sm px-3 py-2 rounded border border-neutral-700 bg-neutral-800 hover:bg-neutral-700 text-left disabled:opacity-60"
+                  title={`Нажмите ${idx + 1}`}
                 >
-                  {o.text}
+                  <span className="opacity-60 mr-2">{idx + 1}.</span>{o.text}
                 </button>
               ))}
             </div>
           )}
 
+          {/* Свободный ввод */}
+          <div className="mt-3 flex gap-2">
+            <input
+              value={playerInput}
+              onChange={(e) => setPlayerInput(e.target.value)}
+              placeholder="Введите свой ответ (Enter — отправить)"
+              className="flex-1 bg-neutral-800 border border-neutral-700 rounded px-3 py-2 text-sm outline-none focus:border-neutral-500 disabled:opacity-60"
+              disabled={npcThinking}
+            />
+            <button
+              onClick={() => playerInput.trim() && sendFreeText(playerInput)}
+              disabled={npcThinking || !playerInput.trim()}
+              className="text-sm px-3 py-2 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60"
+            >
+              Отправить
+            </button>
+          </div>
+
+          <div className="mt-2 text-xs opacity-60">
+            Подсказки: <kbd>1–9</kbd> — выбрать вариант, <kbd>Enter</kbd> — отправить текст
+          </div>
+
+          {/* События/лог */}
           <div className="mt-3">
             <div className="font-medium mb-1">События</div>
             <div className="space-y-1 max-h-24 overflow-auto text-xs opacity-80">
